@@ -165,17 +165,25 @@ class UniformVelocityCommand(CommandTerm):
         if debug_vis:
             # create markers if necessary for the first time
             if not hasattr(self, "goal_vel_visualizer"):
-                # -- goal
+                # -- goal linear velocity
                 self.goal_vel_visualizer = VisualizationMarkers(self.cfg.goal_vel_visualizer_cfg)
-                # -- current
+                # -- current linear velocity
                 self.current_vel_visualizer = VisualizationMarkers(self.cfg.current_vel_visualizer_cfg)
+                # -- goal angular velocity
+                self.goal_ang_vel_visualizer = VisualizationMarkers(self.cfg.goal_ang_vel_visualizer_cfg)
+                # -- current angular velocity
+                self.current_ang_vel_visualizer = VisualizationMarkers(self.cfg.current_ang_vel_visualizer_cfg)
             # set their visibility to true
             self.goal_vel_visualizer.set_visibility(True)
             self.current_vel_visualizer.set_visibility(True)
+            self.goal_ang_vel_visualizer.set_visibility(True)
+            self.current_ang_vel_visualizer.set_visibility(True)
         else:
             if hasattr(self, "goal_vel_visualizer"):
                 self.goal_vel_visualizer.set_visibility(False)
                 self.current_vel_visualizer.set_visibility(False)
+                self.goal_ang_vel_visualizer.set_visibility(False)
+                self.current_ang_vel_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
         # check if robot is initialized
@@ -186,12 +194,17 @@ class UniformVelocityCommand(CommandTerm):
         # -- base state
         base_pos_w = self.robot.data.root_pos_w.clone()
         base_pos_w[:, 2] += 0.5
-        # -- resolve the scales and quaternions
+        # -- resolve the scales and quaternions for linear velocity (horizontal arrows)
         vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_xy_velocity_to_arrow(self.command[:, :2])
         vel_arrow_scale, vel_arrow_quat = self._resolve_xy_velocity_to_arrow(self.robot.data.root_lin_vel_b[:, :2])
+        # -- resolve the scales and quaternions for angular velocity (vertical arrows)
+        ang_vel_des_arrow_scale, ang_vel_des_arrow_quat = self._resolve_z_angular_velocity_to_arrow(self.command[:, 2])
+        ang_vel_arrow_scale, ang_vel_arrow_quat = self._resolve_z_angular_velocity_to_arrow(self.robot.data.root_ang_vel_b[:, 2])
         # display markers
         self.goal_vel_visualizer.visualize(base_pos_w, vel_des_arrow_quat, vel_des_arrow_scale)
         self.current_vel_visualizer.visualize(base_pos_w, vel_arrow_quat, vel_arrow_scale)
+        self.goal_ang_vel_visualizer.visualize(base_pos_w, ang_vel_des_arrow_quat, ang_vel_des_arrow_scale)
+        self.current_ang_vel_visualizer.visualize(base_pos_w, ang_vel_arrow_quat, ang_vel_arrow_scale)
 
     """
     Internal helpers.
@@ -208,6 +221,39 @@ class UniformVelocityCommand(CommandTerm):
         heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
         zeros = torch.zeros_like(heading_angle)
         arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, heading_angle)
+        # convert everything back from base to world frame
+        base_quat_w = self.robot.data.root_quat_w
+        arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
+
+        return arrow_scale, arrow_quat
+
+    def _resolve_z_angular_velocity_to_arrow(self, ang_vel_z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Converts the Z angular velocity command to vertical arrow (pointing up for positive/CCW, down for negative/CW).
+        
+        Args:
+            ang_vel_z: Angular velocity around Z axis (positive = counter-clockwise/left turn)
+        
+        Returns:
+            tuple: (arrow_scale, arrow_quat) for visualization
+        """
+        # obtain default scale of the marker
+        default_scale = self.goal_ang_vel_visualizer.cfg.markers["arrow"].scale
+        # arrow-scale
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(ang_vel_z.shape[0], 1)
+        # Scale the arrow length based on angular velocity magnitude
+        arrow_scale[:, 0] *= torch.abs(ang_vel_z) * 3.0
+        
+        # arrow-direction: point up (+Z) for positive ang_vel (left turn), down (-Z) for negative (right turn)
+        # Create quaternions that rotate the arrow to point vertically
+        # Default arrow points in +X, we need to rotate it to +Z (up) or -Z (down)
+        zeros = torch.zeros_like(ang_vel_z)
+        ninety_deg = torch.ones_like(ang_vel_z) * (torch.pi / 2)
+        
+        # For positive ang_vel_z (CCW/left turn): rotate arrow by -90° around Y to point up (+Z)
+        # For negative ang_vel_z (CW/right turn): rotate arrow by +90° around Y to point down (-Z)
+        pitch_angle = torch.where(ang_vel_z >= 0, -ninety_deg, ninety_deg)
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, pitch_angle, zeros)
+        
         # convert everything back from base to world frame
         base_quat_w = self.robot.data.root_quat_w
         arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
