@@ -8,7 +8,13 @@ import os
 import torch
 
 
-def export_policy_as_jit(policy: object, normalizer: object | None, path: str, filename="policy.pt"):
+def export_policy_as_jit(
+    policy: object,
+    normalizer: object | None,
+    path: str,
+    filename="policy.pt",
+    obs_permutation: torch.Tensor | list[int] | None = None,
+):
     """Export policy into a Torch JIT file.
 
     Args:
@@ -16,13 +22,22 @@ def export_policy_as_jit(policy: object, normalizer: object | None, path: str, f
         normalizer: The empirical normalizer module. If None, Identity is used.
         path: The path to the saving directory.
         filename: The name of exported JIT file. Defaults to "policy.pt".
+        obs_permutation: Optional permutation (list or tensor of indices) that maps
+            the *incoming* observation order to the order used during training.
+            If provided, the exported module will internally reorder its inputs
+            before passing them to the normalizer and policy.
     """
-    policy_exporter = _TorchPolicyExporter(policy, normalizer)
+    policy_exporter = _TorchPolicyExporter(policy, normalizer, obs_permutation)
     policy_exporter.export(path, filename)
 
 
 def export_policy_as_onnx(
-    policy: object, path: str, normalizer: object | None = None, filename="policy.onnx", verbose=False
+    policy: object,
+    path: str,
+    normalizer: object | None = None,
+    filename="policy.onnx",
+    verbose=False,
+    obs_permutation: torch.Tensor | list[int] | None = None,
 ):
     """Export policy into a Torch ONNX file.
 
@@ -32,10 +47,14 @@ def export_policy_as_onnx(
         path: The path to the saving directory.
         filename: The name of exported ONNX file. Defaults to "policy.onnx".
         verbose: Whether to print the model summary. Defaults to False.
+        obs_permutation: Optional permutation (list or tensor of indices) that maps
+            the *incoming* observation order to the order used during training.
+            If provided, the exported module will internally reorder its inputs
+            before passing them to the normalizer and policy.
     """
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-    policy_exporter = _OnnxPolicyExporter(policy, normalizer, verbose)
+    policy_exporter = _OnnxPolicyExporter(policy, normalizer, verbose, obs_permutation)
     policy_exporter.export(path, filename)
 
 
@@ -47,7 +66,7 @@ Helper Classes - Private.
 class _TorchPolicyExporter(torch.nn.Module):
     """Exporter of actor-critic into JIT file."""
 
-    def __init__(self, policy, normalizer=None):
+    def __init__(self, policy, normalizer=None, obs_permutation=None):
         super().__init__()
         self.is_recurrent = policy.is_recurrent
         # copy policy parameters
@@ -80,8 +99,20 @@ class _TorchPolicyExporter(torch.nn.Module):
             self.normalizer = copy.deepcopy(normalizer)
         else:
             self.normalizer = torch.nn.Identity()
+        # optional observation permutation to support custom external ordering
+        if obs_permutation is not None:
+            perm_tensor = torch.as_tensor(obs_permutation, dtype=torch.long)
+            self.register_buffer("obs_permutation", perm_tensor)
+        else:
+            self.obs_permutation = None
+
+    def _maybe_reorder(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.obs_permutation is not None:
+            return torch.index_select(obs, dim=-1, index=self.obs_permutation)
+        return obs
 
     def forward_lstm(self, x):
+        x = self._maybe_reorder(x)
         x = self.normalizer(x)
         x, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
         self.hidden_state[:] = h
@@ -90,6 +121,7 @@ class _TorchPolicyExporter(torch.nn.Module):
         return self.actor(x)
 
     def forward_gru(self, x):
+        x = self._maybe_reorder(x)
         x = self.normalizer(x)
         x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
         self.hidden_state[:] = h
@@ -97,6 +129,7 @@ class _TorchPolicyExporter(torch.nn.Module):
         return self.actor(x)
 
     def forward(self, x):
+        x = self._maybe_reorder(x)
         return self.actor(self.normalizer(x))
 
     @torch.jit.export
@@ -119,7 +152,7 @@ class _TorchPolicyExporter(torch.nn.Module):
 class _OnnxPolicyExporter(torch.nn.Module):
     """Exporter of actor-critic into ONNX file."""
 
-    def __init__(self, policy, normalizer=None, verbose=False):
+    def __init__(self, policy, normalizer=None, verbose=False, obs_permutation=None):
         super().__init__()
         self.verbose = verbose
         self.is_recurrent = policy.is_recurrent
@@ -149,20 +182,34 @@ class _OnnxPolicyExporter(torch.nn.Module):
             self.normalizer = copy.deepcopy(normalizer)
         else:
             self.normalizer = torch.nn.Identity()
+        # optional observation permutation to support custom external ordering
+        if obs_permutation is not None:
+            perm_tensor = torch.as_tensor(obs_permutation, dtype=torch.long)
+            self.register_buffer("obs_permutation", perm_tensor)
+        else:
+            self.obs_permutation = None
+
+    def _maybe_reorder(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.obs_permutation is not None:
+            return torch.index_select(obs, dim=-1, index=self.obs_permutation)
+        return obs
 
     def forward_lstm(self, x_in, h_in, c_in):
+        x_in = self._maybe_reorder(x_in)
         x_in = self.normalizer(x_in)
         x, (h, c) = self.rnn(x_in.unsqueeze(0), (h_in, c_in))
         x = x.squeeze(0)
         return self.actor(x), h, c
 
     def forward_gru(self, x_in, h_in):
+        x_in = self._maybe_reorder(x_in)
         x_in = self.normalizer(x_in)
         x, h = self.rnn(x_in.unsqueeze(0), h_in)
         x = x.squeeze(0)
         return self.actor(x), h
 
     def forward(self, x):
+        x = self._maybe_reorder(x)
         return self.actor(self.normalizer(x))
 
     def export(self, path, filename):
